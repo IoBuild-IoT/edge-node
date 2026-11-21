@@ -1,0 +1,4 @@
+# Credenciales locales: nunca al repo
+firmware/iobuild_edge_node/secrets.h
+# Pruebas en PC
+test/build/

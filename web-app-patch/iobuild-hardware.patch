@@ -1,0 +1,144 @@
+diff --git a/.env.example b/.env.example
+index a4a0a6c..e76601a 100644
+--- a/.env.example
++++ b/.env.example
+@@ -43,3 +43,7 @@ VITE_CLOUDINARY_UPLOAD_PRESET=tu_upload_preset
+ # Habilitado por defecto en la red interna de Docker
+ MQTT_HOST=mosquitto
+ MQTT_PORT=1883
++
++# ── 6. Hardware real (nodo ESP32, ver hardware/README.md y el repo IoBuild-IoT/edge-node) ──
++# IDs de los dispositivos que atiende el ESP32 (separados por coma). El simulador los ignora.
++HARDWARE_DEVICE_IDS=
+diff --git a/docker-compose.dokploy.yml b/docker-compose.dokploy.yml
+index 14a2896..dfaed83 100644
+--- a/docker-compose.dokploy.yml
++++ b/docker-compose.dokploy.yml
+@@ -172,6 +172,8 @@ services:
+     environment:
+       - MQTT_HOST=mosquitto
+       - MQTT_PORT=1883
++      # IDs de dispositivos atendidos por el ESP32 real (hardware/); el simulador los ignora
++      - HARDWARE_DEVICE_IDS=${HARDWARE_DEVICE_IDS:-}
+       - MQTT_USERNAME=${MQTT_USERNAME:-iobuild}
+       - MQTT_PASSWORD=${MQTT_PASSWORD:?Set MQTT_PASSWORD in Dokploy}
+     depends_on:
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 976d25b..b4d4f7f 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -178,6 +178,8 @@ services:
+     environment:
+       - MQTT_HOST=mosquitto
+       - MQTT_PORT=1883
++      # IDs de dispositivos atendidos por el ESP32 real (hardware/); el simulador los ignora
++      - HARDWARE_DEVICE_IDS=${HARDWARE_DEVICE_IDS:-}
+     depends_on:
+       - mosquitto
+     networks:
+diff --git a/hardware/README.md b/hardware/README.md
+new file mode 100644
+index 0000000..51e3ed3
+--- /dev/null
++++ b/hardware/README.md
+@@ -0,0 +1,11 @@
++# Hardware real (nodo ESP32)
++
++El firmware del prototipo físico vive en el repositorio **IoBuild-IoT/edge-node**. Allí está la guía completa para conectarlo a esta plataforma.
++
++Cambios de este repositorio que lo hacen posible:
++
++- `iot-simulator/simulator.py`: la variable `HARDWARE_DEVICE_IDS` (IDs separados por coma) hace que el simulador ignore los dispositivos atendidos por el ESP32, para que no publique telemetría falsa sobre ellos.
++- `docker-compose.yml` y `docker-compose.dokploy.yml`: pasan `HARDWARE_DEVICE_IDS` al simulador.
++- El backend y el frontend no cambian: el ESP32 usa el mismo contrato MQTT que el simulador (`telemetry/{id}` y `commands/{id}`).
++
++Prueba del filtro: `python -m unittest discover -s iot-simulator -p "test_*.py"`
+diff --git a/iot-simulator/simulator.py b/iot-simulator/simulator.py
+index 4ef8214..db54099 100644
+--- a/iot-simulator/simulator.py
++++ b/iot-simulator/simulator.py
+@@ -17,6 +17,10 @@ Environment variables:
+   MQTT_HOST  - MQTT broker host (default: localhost)
+   MQTT_PORT  - MQTT broker port (default: 1883)
+   MQTT_USERNAME / MQTT_PASSWORD - broker credentials (optional; anonymous when unset)
++  HARDWARE_DEVICE_IDS - comma-separated device ids served by real hardware
++                        (e.g. the ESP32 edge node in hardware/). The simulator
++                        ignores them so it never publishes fake telemetry or
++                        answers commands for a physical device. Default: none.
+ """
+ 
+ import os
+@@ -33,6 +37,19 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+ MQTT_USERNAME = os.getenv("MQTT_USERNAME")
+ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
+ 
++
++def parse_hardware_ids(raw: str | None) -> frozenset[int]:
++    """Parse HARDWARE_DEVICE_IDS ("7, 8") into a set of ints; ignores blanks and junk."""
++    ids = set()
++    for part in (raw or "").split(","):
++        part = part.strip()
++        if part.isdigit():
++            ids.add(int(part))
++    return frozenset(ids)
++
++
++HARDWARE_DEVICE_IDS = parse_hardware_ids(os.getenv("HARDWARE_DEVICE_IDS"))
++
+ LOCATIONS = ["Sector-A", "Sector-B", "Sector-C", "Sector-D", "Sector-E"]
+ STATUS_WEIGHTS = ["online"] * 3 + ["idle"]  # 75% online, 25% idle
+ 
+@@ -154,6 +171,9 @@ def on_connect(client, userdata, flags, rc, properties=None):
+ 
+ 
+ def _handle_registry(client, device_id: int, raw: bytes):
++    if device_id in HARDWARE_DEVICE_IDS:
++        print(f"[REGISTRY] device {device_id} served by real hardware; simulator skips it")
++        return
+     if not raw:  # tombstone -> remove device
+         with _lock:
+             _devices.pop(device_id, None)
+diff --git a/iot-simulator/test_simulator.py b/iot-simulator/test_simulator.py
+new file mode 100644
+index 0000000..a45b6e2
+--- /dev/null
++++ b/iot-simulator/test_simulator.py
+@@ -0,0 +1,38 @@
++"""Run: python -m unittest iot-simulator/test_simulator.py (from repo root) or python -m unittest test_simulator."""
++import os
++import sys
++import unittest
++
++sys.path.insert(0, os.path.dirname(__file__))
++import simulator  # noqa: E402
++
++
++class FakeClient:
++    def __init__(self):
++        self.subscribed = []
++
++    def subscribe(self, topic, qos=0):
++        self.subscribed.append(topic)
++
++    def unsubscribe(self, topic):
++        pass
++
++
++class HardwareDeviceIdsTest(unittest.TestCase):
++    def test_parse(self):
++        self.assertEqual(simulator.parse_hardware_ids(" 7, 8,,x, 12 "), frozenset({7, 8, 12}))
++        self.assertEqual(simulator.parse_hardware_ids(None), frozenset())
++
++    def test_registry_skips_hardware_ids_and_keeps_others(self):
++        simulator.HARDWARE_DEVICE_IDS = frozenset({7})
++        simulator._devices.clear()
++        client = FakeClient()
++        simulator._handle_registry(client, 7, b'{"deviceId": 7, "type": "SmartLight"}')
++        simulator._handle_registry(client, 9, b'{"deviceId": 9, "type": "SmartMeter"}')
++        self.assertNotIn(7, simulator._devices)
++        self.assertIn(9, simulator._devices)
++        self.assertEqual(client.subscribed, ["commands/9"])
++
++
++if __name__ == "__main__":
++    unittest.main()
